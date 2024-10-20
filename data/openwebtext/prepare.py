@@ -6,10 +6,11 @@ from tqdm import tqdm
 import numpy as np
 import tiktoken
 from datasets import load_dataset # huggingface datasets
+import csv
 
 # number of workers in .map() call
 # good number to use is ~order number of cpu cores // 2
-num_proc = 8
+num_proc = 30
 
 # number of workers in load_dataset() call
 # best number might be different from num_proc above as it also depends on NW speed.
@@ -25,7 +26,7 @@ if __name__ == '__main__':
     # owt by default only contains the 'train' split, so create a test split
     split_dataset = dataset["train"].train_test_split(test_size=0.0005, seed=2357, shuffle=True)
     split_dataset['val'] = split_dataset.pop('test') # rename the test split to val
-
+    #split_dataset['train'] = split_dataset['train'].select([i for i in range(10000)])
     # this results in:
     # >>> split_dataset
     # DatasetDict({
@@ -46,6 +47,7 @@ if __name__ == '__main__':
         # note: I think eot should be prepended not appended... hmm. it's called "eot" though...
         out = {'ids': ids, 'len': len(ids)}
         return out
+    
 
     # tokenize the dataset
     tokenized = split_dataset.map(
@@ -61,9 +63,10 @@ if __name__ == '__main__':
         filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
         dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
-        total_batches = 1024
 
+        total_batches = 1024
         idx = 0
+        avg_len = 0
         for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
             # Batch together samples for faster write
             batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
@@ -71,6 +74,12 @@ if __name__ == '__main__':
             # Write into mmap
             arr[idx : idx + len(arr_batch)] = arr_batch
             idx += len(arr_batch)
+            avglen = batch['len'].mean()
+            if batch_idx == 0:
+                avg_len = avglen
+            else:
+                avg_len =((avg_len)*batch_idx + avglen)/(batch_idx+1)
+            print(avg_len)
         arr.flush()
 
     # train.bin is ~17GB, val.bin ~8.5MB

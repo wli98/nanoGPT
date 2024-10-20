@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -39,13 +40,21 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+window_training = False
+y_transformer=False
+y_mlp=False
+y_mlp_depth=3
+cross_encode=False
+window_size = None
+interm_layer_idx = None
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+log_grad = False
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+gradient_accumulation_steps = 1 #5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -55,7 +64,9 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+#learning_rate = 1e-4 # max learning rate
+learning_rate = 5e-5 # max learning rate
+
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -71,7 +82,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -145,7 +156,9 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
+                  interm_layer_idx=interm_layer_idx,cross_encode=cross_encode,
+                  y_transformer=y_transformer,y_mlp=y_mlp,y_mlp_depth=y_mlp_depth) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -218,10 +231,40 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+        for k in tqdm(range(eval_iters)):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                if window_training:
+                    total_loss = 0
+                    split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
+                    kv_cache = None 
+                    xa_cache = None
+                    y_cache = None
+                    interm_embed = None
+                    for win_X,win_Y in zip(split_X,split_Y):
+                        logits,loss,kv,xa,y,interm_embed,_ = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache) 
+                        if kv_cache is None:
+                            kv_cache = kv 
+                        else:
+                            for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
+                                kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+                        if xa_cache is None:
+                            xa_cache = []
+                        elif len(xa_cache) == 0:
+                            xa_cache = xa
+                        elif isinstance(xa_cache,list): 
+                            for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
+                                xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
+                        if y_cache is None:
+                            y_cache = y
+                        else: 
+                            for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
+                                y_cache[i] = torch.cat([old_y,new_y],dim=2)
+ 
+                        total_loss += loss
+                    loss = loss.mean()
+                else:
+                    logits, loss,_ = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -297,8 +340,40 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            if window_training:
+                split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
+                interm_embed = None
+                kv_cache = None
+                xa_cache = None
+                y_cache =None
+                loss = 0
+                for win_X,win_Y in zip(split_X,split_Y):
+                    #logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
+                    logits,mini_loss,kv,xa,y,interm_embed,weights = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache) 
+
+                    loss += mini_loss
+                    if kv_cache is None:
+                        kv_cache = kv 
+                    else:
+                        for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
+                            kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+                    if xa_cache is None:
+                        xa_cache = []
+                    elif len(xa_cache) == 0:
+                        xa_cache = xa
+                    elif isinstance(xa_cache,list): 
+                        for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
+                            xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
+                    if y_cache is None:
+                        y_cache = y
+                    else: 
+                        for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
+                            y_cache[i] = torch.cat([old_y,new_y],dim=2)
+
+
+            else:
+                logits, loss,_ = model(X, Y)
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -310,6 +385,27 @@ while True:
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
+    #log grad norm
+    if iter_num % log_interval == 0 and master_process and wandb_log and log_grad:
+        for i,layer in enumerate(model.module.transformer.h):
+            total_norm = 0
+            for param in layer.parameters():
+                param_norm = param.grad.data.norm(2)
+                total_norm += param_norm
+            wandb.log({
+                "iter": iter_num,
+                f"grad/layer {i}": total_norm
+            })
+        if hasattr(model.module,"y_transformer"):
+            for i,layer in enumerate(model.module.y_transformer.h):
+                total_norm = 0
+                for param in layer.parameters():
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm
+                wandb.log({
+                    "iter": iter_num,
+                    f"grad/y_layer {i}": total_norm
+                })
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -325,6 +421,18 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if wandb_log:
+           wandb.log({
+                "iter": iter_num,
+                "train_log/loss": lossf,
+            })
+           for i,pair in enumerate(weights):
+                wandb.log({
+                "iter": iter_num,
+                f"weight_{i}/xa": pair[0].item(),
+                f"weight_{i}/kv": pair[1].item(),
+            })
+
     iter_num += 1
     local_iter_num += 1
 
