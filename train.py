@@ -229,7 +229,6 @@ def estimate_loss():
                     split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
                     kv_cache = None 
                     for win_X,win_Y in zip(split_X,split_Y):
-                        import pdb; pdb.set_trace()
                         logits,loss,kv = model(win_X,win_Y,kv_cache) 
                         if kv_cache is None:
                             kv_cache = kv 
@@ -318,10 +317,17 @@ while True:
             if window_training:
                 split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
                 embeds = None
+                kv_cache = None
+                loss = 0
                 for win_X,win_Y in zip(split_X,split_Y):
-                    import pdb; pdb.set_trace()
-                    logits,loss,interm_embeds = model(win_X,win_Y,embeds) 
-                    embeds = torch.cat([embeds,interm_embeds],dim=1)
+                    logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
+                    loss += mini_loss
+                    if kv_cache is None:
+                        kv_cache = kv 
+                    else:
+                        for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
+                            kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+
             else:
                 logits, loss = model(X, Y)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.attention.bias import causal_lower_right
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -49,7 +50,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x,kv=None):
+    def forward(self, x,kv=None,interm_embed=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -58,12 +59,19 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         if kv is not None:
-            import pdb; pdb.set_trace()
+            assert interm_embed is not None
             k_cache,v_cache = torch.split(kv,kv.shape[0]//2,dim=0)
+            k_interm, v_interm = torch.split(interm_embed,interm_embed.shape[0]//2,dim=0)
+            combined_k = torch.cat([k_interm,k_cache,k],dim=2)
+            combined_v = torch.cat([v_interm,v_cache,v],dim=2)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            if kv is not None:
+                attn_bias = causal_lower_right(q.shape[2], k.shape[2])
+                y = torch.nn.functional.scaled_dot_product_attention(q, combined_k, combined_v, attn_mask=attn_bias, dropout_p=self.dropout if self.training else 0, is_causal=False)
+            else:
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             if kv is not None:
                 raise Exception("need to implement lower right bias for kv cache")
@@ -104,8 +112,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x,kv=None):
-        y,kv = self.attn(self.ln_1(x),kv=kv)
+    def forward(self, x,kv=None,interm_embed=None):
+        y,kv = self.attn(self.ln_1(x),kv=kv,interm_embed=interm_embed)
         x = x + y 
         x = x + self.mlp(self.ln_2(x))
         return x,kv
@@ -143,7 +151,7 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-        self.ite = nn.Embedding(1,config.n_embd) if self.config.window_training else None
+        self.wie = nn.Parameter(torch.zeros(config.n_head,config.n_embd//config.n_head))
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -187,9 +195,11 @@ class GPT(nn.Module):
         new_kv = [] 
         x = self.transformer.drop(tok_emb + pos_emb)
         for i,block in enumerate(self.transformer.h):
-            #if kv_cache:
-            #    kv = kv_cache[i] + self.wie 
-            x,kv = block(x,kv_cache[i] if kv_cache else None)
+            kv_cache_i = kv_cache[i] if kv_cache else None
+            interm_embed = kv_cache[self.config.interm_layer_idx] if kv_cache else None
+            if interm_embed is not None:
+                interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
+            x,kv = block(x,kv_cache_i,interm_embed)
             new_kv.append(torch.cat(kv).clone().detach()) 
             #if interm_embeds and i < len(self.transformer.h)-1:
             #    interm_embeds.append(x.clone().detach())
