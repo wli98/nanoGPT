@@ -36,6 +36,8 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        if config.cross_encode:
+            self.c_encode = nn.Linear(config.n_embd,2 * config.n_embd,bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -50,7 +52,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x,kv=None,interm_embed=None):
+    def forward(self, x,kv=None,interm_embed=None,new_xa=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -64,6 +66,12 @@ class CausalSelfAttention(nn.Module):
             k_interm, v_interm = torch.split(interm_embed,interm_embed.shape[0]//2,dim=0)
             combined_k = torch.cat([k_interm,k_cache,k],dim=2)
             combined_v = torch.cat([v_interm,v_cache,v],dim=2)
+        new_k,new_v = None,None
+        if new_xa is not None:
+            new_embed = self.c_encode(new_xa)
+            new_k,new_v = torch.split(new_embed,new_embed.shape[0]//2,dim=0)
+            combined_k  = torch.cat([combined_k,new_k],dim=2)
+            combined_v = torch.cat([combined_v,new_v],dim=2)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -85,7 +93,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y,(k,v)
+        return y,(k,v), (new_k,new_v)
 
 class MLP(nn.Module):
 
@@ -112,11 +120,11 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x,kv=None,interm_embed=None):
-        y,kv = self.attn(self.ln_1(x),kv=kv,interm_embed=interm_embed)
+    def forward(self, x,kv=None,interm_embed=None,new_xa=None):
+        y,kv,xa = self.attn(self.ln_1(x),kv=kv,interm_embed=interm_embed,new_xa=new_xa)
         x = x + y 
         x = x + self.mlp(self.ln_2(x))
-        return x,kv
+        return x,kv,xa
 
 @dataclass
 class GPTConfig:
@@ -129,6 +137,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     window_training: bool = False
     interm_layer_idx: int = 8
+    cross_encode: bool = False
 
 class GPT(nn.Module):
 
@@ -151,7 +160,8 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-        self.wie = nn.Parameter(torch.zeros(config.n_head,config.n_embd//config.n_head))
+        if self.config.window_training and not self.config.cross_encode:
+            self.wie = nn.Parameter(torch.zeros(config.n_head,config.n_embd//config.n_head))
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -182,7 +192,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None,kv_cache=None):
+    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -193,16 +203,23 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         
         new_kv = [] 
+        new_xa = []
+        new_interm_embed = None
         x = self.transformer.drop(tok_emb + pos_emb)
         for i,block in enumerate(self.transformer.h):
             kv_cache_i = kv_cache[i] if kv_cache else None
-            interm_embed = kv_cache[self.config.interm_layer_idx] if kv_cache else None
-            if interm_embed is not None:
-                interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
-            x,kv = block(x,kv_cache_i,interm_embed)
+            if not self.config.cross_encode:
+                interm_embed = kv_cache[self.config.interm_layer_idx] if kv_cache else None
+                if interm_embed is not None:
+                    interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
+            else:
+                interm_embed = xa_cache[i] if xa_cache else None
+            x,kv,xa = block(x,kv_cache_i,interm_embed,xa_in)
             new_kv.append(torch.cat(kv).clone().detach()) 
-            #if interm_embeds and i < len(self.transformer.h)-1:
-            #    interm_embeds.append(x.clone().detach())
+            if xa[0] is not None:
+                new_xa.append(torch.cat(xa).clone().detach())
+            if i == self.config.interm_layer_idx:
+                new_interm_embed = x
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -214,7 +231,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, new_kv
+        return logits, loss, new_kv,new_xa, new_interm_embed
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

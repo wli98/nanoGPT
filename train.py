@@ -40,7 +40,9 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 window_training = False
+cross_encode=False
 window_size = None
+interm_layer_idx = None
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -148,7 +150,7 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
-                  interm_layer_idx=interm_layer_idx) # start with model_args from command line
+                  interm_layer_idx=interm_layer_idx,cross_encode=cross_encode) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -228,13 +230,22 @@ def estimate_loss():
                     total_loss = 0
                     split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
                     kv_cache = None 
+                    xa_cache = None
+                    interm_embed = None
                     for win_X,win_Y in zip(split_X,split_Y):
-                        logits,loss,kv = model(win_X,win_Y,kv_cache) 
+                        logits,loss,kv,xa,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
+                        import pdb; pdb.set_trace()
                         if kv_cache is None:
                             kv_cache = kv 
                         else:
                             for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
                                 kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+                        if xa_cache is None:
+                            xa_cache = []
+                        elif isinstance(xa_cache,list): 
+                            for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
+                                xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
+ 
                         total_loss += loss
                     loss = loss.mean()
                 else:
@@ -329,7 +340,7 @@ while True:
                             kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
 
             else:
-                logits, loss = model(X, Y)
+                logits, loss,_ = model(X, Y)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
