@@ -39,13 +39,15 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+window_training = False
+window_size = None
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'fineweb'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+dataset = 'openwebtext'
+gradient_accumulation_steps = 1 #5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -71,7 +73,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -145,7 +147,8 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
+                  interm_layer_idx=interm_layer_idx) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -221,7 +224,22 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                if window_training:
+                    total_loss = 0
+                    split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
+                    kv_cache = None 
+                    for win_X,win_Y in zip(split_X,split_Y):
+                        import pdb; pdb.set_trace()
+                        logits,loss,kv = model(win_X,win_Y,kv_cache) 
+                        if kv_cache is None:
+                            kv_cache = kv 
+                        else:
+                            for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
+                                kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+                        total_loss += loss
+                    loss = loss.mean()
+                else:
+                    logits, loss,_ = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -297,8 +315,16 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            if window_training:
+                split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
+                embeds = None
+                for win_X,win_Y in zip(split_X,split_Y):
+                    import pdb; pdb.set_trace()
+                    logits,loss,interm_embeds = model(win_X,win_Y,embeds) 
+                    embeds = torch.cat([embeds,interm_embeds],dim=1)
+            else:
+                logits, loss = model(X, Y)
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
