@@ -52,7 +52,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x,kv=None,interm_embed=None,new_xa=None):
+    def forward(self, x,kv=None,xa=None,new_xa=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -61,17 +61,23 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         if kv is not None:
-            assert interm_embed is not None
             k_cache,v_cache = torch.split(kv,kv.shape[0]//2,dim=0)
-            k_interm, v_interm = torch.split(interm_embed,interm_embed.shape[0]//2,dim=0)
-            combined_k = torch.cat([k_interm,k_cache,k],dim=2)
-            combined_v = torch.cat([v_interm,v_cache,v],dim=2)
+            if xa is not None:
+                k_interm, v_interm = torch.split(xa,xa.shape[0]//2,dim=0)
+                combined_k = torch.cat([k_interm,k_cache,k],dim=2)
+                combined_v = torch.cat([v_interm,v_cache,v],dim=2)
+            else:
+                combined_k = torch.cat([k_cache,k],dim=2)
+                combined_v = torch.cat([v_cache,v],dim=2)
+ 
         new_k,new_v = None,None
         if new_xa is not None:
-            new_embed = self.c_encode(new_xa)
-            new_k,new_v = torch.split(new_embed,new_embed.shape[0]//2,dim=0)
-            combined_k  = torch.cat([combined_k,new_k],dim=2)
-            combined_v = torch.cat([combined_v,new_v],dim=2)
+            new_k,new_v = self.c_encode(new_xa).split(self.n_embd,dim=2)
+            new_k = new_k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            new_v = new_v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            combined_k  = torch.cat([new_k,combined_k],dim=2)
+            combined_v = torch.cat([new_v,combined_v,new_v],dim=2)
+        import pdb; pdb.set_trace()
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -120,8 +126,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x,kv=None,interm_embed=None,new_xa=None):
-        y,kv,xa = self.attn(self.ln_1(x),kv=kv,interm_embed=interm_embed,new_xa=new_xa)
+    def forward(self, x,kv=None,xa=None,new_xa=None):
+        y,kv,xa = self.attn(self.ln_1(x),kv=kv,xa=xa,new_xa=new_xa)
         x = x + y 
         x = x + self.mlp(self.ln_2(x))
         return x,kv,xa

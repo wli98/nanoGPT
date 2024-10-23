@@ -234,7 +234,6 @@ def estimate_loss():
                     interm_embed = None
                     for win_X,win_Y in zip(split_X,split_Y):
                         logits,loss,kv,xa,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
-                        import pdb; pdb.set_trace()
                         if kv_cache is None:
                             kv_cache = kv 
                         else:
