@@ -76,8 +76,7 @@ class CausalSelfAttention(nn.Module):
             new_k = new_k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             new_v = new_v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             combined_k  = torch.cat([new_k,combined_k],dim=2)
-            combined_v = torch.cat([new_v,combined_v,new_v],dim=2)
-        import pdb; pdb.set_trace()
+            combined_v = torch.cat([new_v,combined_v],dim=2)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
