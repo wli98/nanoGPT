@@ -326,17 +326,25 @@ while True:
         with ctx:
             if window_training:
                 split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
-                embeds = None
+                interm_embed = None
                 kv_cache = None
+                xa_cache = None
                 loss = 0
                 for win_X,win_Y in zip(split_X,split_Y):
-                    logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
+                    #logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
+                    logits,mini_loss,kv,xa,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
+
                     loss += mini_loss
                     if kv_cache is None:
                         kv_cache = kv 
                     else:
                         for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
                             kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+                    if xa_cache is None:
+                        xa_cache = []
+                    elif isinstance(xa_cache,list): 
+                        for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
+                            xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
 
             else:
                 logits, loss,_ = model(X, Y)
