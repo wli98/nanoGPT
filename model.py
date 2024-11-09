@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+import copy
 
 import torch
 import torch.nn as nn
@@ -143,6 +144,7 @@ class GPTConfig:
     window_training: bool = False
     interm_layer_idx: int = 8
     cross_encode: bool = False
+    y_transformer: bool = False
 
 class GPT(nn.Module):
 
@@ -159,6 +161,17 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        if config.y_transformer:
+            y_config = copy.deepcopy(config)
+            y_config.cross_encode=False
+            n_y_layers = config.n_layer-config.interm_layer_idx-1 
+            self.y_transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                wpe = nn.Embedding(config.block_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(y_config) for _ in range(n_y_layers)]),
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -197,7 +210,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None):
+    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -213,12 +226,13 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         for i,block in enumerate(self.transformer.h):
             kv_cache_i = kv_cache[i] if kv_cache else None
-            if not self.config.cross_encode:
+            if self.config.cross_encode or self.config.y_transformer:
+                interm_embed = xa_cache[i] if xa_cache else None
+            else:
                 interm_embed = kv_cache[self.config.interm_layer_idx] if kv_cache else None
                 if interm_embed is not None:
                     interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
-            else:
-                interm_embed = xa_cache[i] if xa_cache else None
+            
             x,kv,xa = block(x,kv_cache_i,interm_embed,xa_in)
             new_kv.append(torch.cat(kv).clone().detach()) 
             if xa[0] is not None:
@@ -226,7 +240,16 @@ class GPT(nn.Module):
             if i == self.config.interm_layer_idx:
                 new_interm_embed = x
         x = self.transformer.ln_f(x)
-
+        
+        new_y_kv=[]
+        if self.config.y_transformer:
+            y = new_interm_embed
+            for i,block in enumerate(self.y_transformer.h):
+                y_cache_i = y_cache[i] if y_cache else None
+                y,y_kv,_ = block(y,y_cache_i)
+                new_y_kv.append(torch.cat(kv).clone().detach()) 
+            y = self.transformer.ln_f(y)
+            new_interm_embed = y
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
@@ -236,7 +259,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, new_kv,new_xa, new_interm_embed
+        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

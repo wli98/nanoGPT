@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -40,6 +41,7 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 window_training = False
+y_transformer=False
 cross_encode=False
 window_size = None
 interm_layer_idx = None
@@ -59,7 +61,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 1e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -150,7 +152,7 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
-                  interm_layer_idx=interm_layer_idx,cross_encode=cross_encode) # start with model_args from command line
+                  interm_layer_idx=interm_layer_idx,cross_encode=cross_encode,y_transformer=y_transformer) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -223,7 +225,7 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+        for k in tqdm(range(eval_iters)):
             X, Y = get_batch(split)
             with ctx:
                 if window_training:
@@ -231,9 +233,10 @@ def estimate_loss():
                     split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
                     kv_cache = None 
                     xa_cache = None
+                    y_cache = None
                     interm_embed = None
                     for win_X,win_Y in zip(split_X,split_Y):
-                        logits,loss,kv,xa,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
+                        logits,loss,kv,xa,y,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache) 
                         if kv_cache is None:
                             kv_cache = kv 
                         else:
@@ -244,6 +247,11 @@ def estimate_loss():
                         elif isinstance(xa_cache,list): 
                             for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
                                 xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
+                        if y_cache is None:
+                            y_cache = y
+                        else: 
+                            for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
+                                y_cache[i] = torch.cat([old_y,new_y],dim=2)
  
                         total_loss += loss
                     loss = loss.mean()
@@ -329,11 +337,13 @@ while True:
                 interm_embed = None
                 kv_cache = None
                 xa_cache = None
+                y_cache =None
                 loss = 0
                 for win_X,win_Y in zip(split_X,split_Y):
                     #logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
-                    logits,mini_loss,kv,xa,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
+                    logits,mini_loss,kv,xa,y,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
 
+                    import pdb; pdb.set_trace()
                     loss += mini_loss
                     if kv_cache is None:
                         kv_cache = kv 
@@ -345,6 +355,12 @@ while True:
                     elif isinstance(xa_cache,list): 
                         for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
                             xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
+                    if y_cache is None:
+                        y_cache = y
+                    else: 
+                        for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
+                            y_cache[i] = torch.cat([old_y,new_y],dim=2)
+
 
             else:
                 logits, loss,_ = model(X, Y)

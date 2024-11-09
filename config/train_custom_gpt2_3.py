@@ -12,6 +12,7 @@ batch_size = 32
 block_size = 1024
 window_training=True
 cross_encode=True
+y_transformer=True
 window_size = 128
 interm_layer_idx = 7
 
