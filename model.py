@@ -81,7 +81,13 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
+            xa_weight = kv_weight = 0
             if kv is not None:
+                if xa is not None:
+                    attn_mat = (q @ combined_k.transpose(-2, -1))  
+                    prev_len = (combined_k.shape[2]-q.shape[2])//2
+                    xa_weight = attn_mat[:,:,:,:prev_len].mean()
+                    kv_weight = attn_mat[:,:,:,prev_len:2*prev_len].mean()
                 attn_bias = causal_lower_right(q.shape[2], k.shape[2])
                 y = torch.nn.functional.scaled_dot_product_attention(q, combined_k, combined_v, attn_mask=attn_bias, dropout_p=self.dropout if self.training else 0, is_causal=False)
             else:
@@ -99,7 +105,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y,(k,v), (new_k,new_v)
+        return y,(k,v), (new_k,new_v), (xa_weight,kv_weight)
 
 class MLP(nn.Module):
 
@@ -127,10 +133,10 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x,kv=None,xa=None,new_xa=None):
-        y,kv,xa = self.attn(self.ln_1(x),kv=kv,xa=xa,new_xa=new_xa)
+        y,kv,xa,weights = self.attn(self.ln_1(x),kv=kv,xa=xa,new_xa=new_xa)
         x = x + y 
         x = x + self.mlp(self.ln_2(x))
-        return x,kv,xa
+        return x,kv,xa,weights
 
 @dataclass
 class GPTConfig:
@@ -222,6 +228,7 @@ class GPT(nn.Module):
         
         new_kv = [] 
         new_xa = []
+        attn_weights = []
         new_interm_embed = None
         x = self.transformer.drop(tok_emb + pos_emb)
         for i,block in enumerate(self.transformer.h):
@@ -233,7 +240,8 @@ class GPT(nn.Module):
                 if interm_embed is not None:
                     interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
             
-            x,kv,xa = block(x,kv_cache_i,interm_embed,xa_in)
+            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,xa_in)
+            attn_weights.append(weights)
             new_kv.append(torch.cat(kv).clone().detach()) 
             if xa[0] is not None:
                 new_xa.append(torch.cat(xa).clone().detach())
@@ -246,7 +254,7 @@ class GPT(nn.Module):
             y = new_interm_embed
             for i,block in enumerate(self.y_transformer.h):
                 y_cache_i = y_cache[i] if y_cache else None
-                y,y_kv,_ = block(y,y_cache_i)
+                y,y_kv,_,_ = block(y,y_cache_i)
                 new_y_kv.append(torch.cat(kv).clone().detach()) 
             y = self.y_transformer.ln_f(y)
             new_interm_embed = y
@@ -259,7 +267,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed
+        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed, attn_weights
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

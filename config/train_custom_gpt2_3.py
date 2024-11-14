@@ -5,10 +5,10 @@
 wandb_log = True
 wandb_project = 'owt'
 wandb_run_name='gpt2-124M'
-
+log_grad = True
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 32
+batch_size = 16
 block_size = 1024
 window_training=True
 cross_encode=True

@@ -62,7 +62,9 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 1e-4 # max learning rate
+#learning_rate = 1e-4 # max learning rate
+learning_rate = 5e-5 # max learning rate
+
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -237,7 +239,7 @@ def estimate_loss():
                     y_cache = None
                     interm_embed = None
                     for win_X,win_Y in zip(split_X,split_Y):
-                        logits,loss,kv,xa,y,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache) 
+                        logits,loss,kv,xa,y,interm_embed,_ = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache) 
                         if kv_cache is None:
                             kv_cache = kv 
                         else:
@@ -245,6 +247,8 @@ def estimate_loss():
                                 kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
                         if xa_cache is None:
                             xa_cache = []
+                        elif len(xa_cache) == 0:
+                            xa_cache = xa
                         elif isinstance(xa_cache,list): 
                             for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
                                 xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
@@ -342,7 +346,7 @@ while True:
                 loss = 0
                 for win_X,win_Y in zip(split_X,split_Y):
                     #logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
-                    logits,mini_loss,kv,xa,y,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
+                    logits,mini_loss,kv,xa,y,interm_embed,weights = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
 
                     loss += mini_loss
                     if kv_cache is None:
@@ -352,6 +356,8 @@ while True:
                             kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
                     if xa_cache is None:
                         xa_cache = []
+                    elif len(xa_cache) == 0:
+                        xa_cache = xa
                     elif isinstance(xa_cache,list): 
                         for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
                             xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
@@ -377,7 +383,6 @@ while True:
     scaler.step(optimizer)
     scaler.update()
     #log grad norm
-    '''
     if iter_num % log_interval == 0 and master_process and wandb_log and log_grad:
         for i,layer in enumerate(model.module.transformer.h):
             total_norm = 0
@@ -398,7 +403,6 @@ while True:
                     "iter": iter_num,
                     f"grad/y_layer {i}": total_norm
                 })
-    '''
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -418,6 +422,12 @@ while True:
            wandb.log({
                 "iter": iter_num,
                 "train_log/loss": lossf,
+            })
+           for i,pair in enumerate(weights):
+                wandb.log({
+                "iter": iter_num,
+                f"weight_{i}/xa": pair[0].item(),
+                f"weight_{i}/kv": pair[1].item(),
             })
 
     iter_num += 1
