@@ -2,7 +2,7 @@
 # launch as the following (e.g. in a screen session) and wait ~5 days:
 # $ torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
 
-wandb_log = False
+wandb_log = True
 wandb_project = 'owt'
 wandb_run_name='gpt2-124M'
 
@@ -24,7 +24,7 @@ lr_decay_iters = 600000
 
 # eval stuff
 eval_interval = 1000
-eval_iters = 200
+eval_iters = 20
 log_interval = 10
 
 # weight decay

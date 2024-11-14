@@ -49,6 +49,7 @@ interm_layer_idx = None
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+log_grad = False
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 1 #5 * 8 # used to simulate larger batch sizes
@@ -343,7 +344,6 @@ while True:
                     #logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
                     logits,mini_loss,kv,xa,y,interm_embed = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
 
-                    import pdb; pdb.set_trace()
                     loss += mini_loss
                     if kv_cache is None:
                         kv_cache = kv 
@@ -376,6 +376,29 @@ while True:
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
+    #log grad norm
+    '''
+    if iter_num % log_interval == 0 and master_process and wandb_log and log_grad:
+        for i,layer in enumerate(model.module.transformer.h):
+            total_norm = 0
+            for param in layer.parameters():
+                param_norm = param.grad.data.norm(2)
+                total_norm += param_norm
+            wandb.log({
+                "iter": iter_num,
+                f"grad/layer {i}": total_norm
+            })
+        if hasattr(model.module,"y_transformer"):
+            for i,layer in enumerate(model.module.y_transformer.h):
+                total_norm = 0
+                for param in layer.parameters():
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm
+                wandb.log({
+                    "iter": iter_num,
+                    f"grad/y_layer {i}": total_norm
+                })
+    '''
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -391,6 +414,12 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if wandb_log:
+           wandb.log({
+                "iter": iter_num,
+                "train_log/loss": lossf,
+            })
+
     iter_num += 1
     local_iter_num += 1
 

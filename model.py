@@ -166,8 +166,8 @@ class GPT(nn.Module):
             y_config.cross_encode=False
             n_y_layers = config.n_layer-config.interm_layer_idx-1 
             self.y_transformer = nn.ModuleDict(dict(
-                wte = nn.Embedding(config.vocab_size, config.n_embd),
-                wpe = nn.Embedding(config.block_size, config.n_embd),
+                #wte = nn.Embedding(config.vocab_size, config.n_embd),
+                #wpe = nn.Embedding(config.block_size, config.n_embd),
                 drop = nn.Dropout(config.dropout),
                 h = nn.ModuleList([Block(y_config) for _ in range(n_y_layers)]),
                 ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -248,7 +248,7 @@ class GPT(nn.Module):
                 y_cache_i = y_cache[i] if y_cache else None
                 y,y_kv,_ = block(y,y_cache_i)
                 new_y_kv.append(torch.cat(kv).clone().detach()) 
-            y = self.transformer.ln_f(y)
+            y = self.y_transformer.ln_f(y)
             new_interm_embed = y
         if targets is not None:
             # if we are given some desired targets also calculate the loss
