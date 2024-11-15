@@ -349,7 +349,7 @@ while True:
                 loss = 0
                 for win_X,win_Y in zip(split_X,split_Y):
                     #logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
-                    logits,mini_loss,kv,xa,y,interm_embed,weights = model(win_X,win_Y,kv_cache,xa_cache,interm_embed) 
+                    logits,mini_loss,kv,xa,y,interm_embed,weights = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache) 
 
                     loss += mini_loss
                     if kv_cache is None:
