@@ -123,6 +123,16 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class MLPBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.block = nn.ModuleList([MLP(config) for _ in range(config.y_mlp_depth)])
+    
+    def forward(self,x):
+        for blk in self.block:
+            x = blk(x)
+        return x 
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -151,6 +161,8 @@ class GPTConfig:
     interm_layer_idx: int = 8
     cross_encode: bool = False
     y_transformer: bool = False
+    y_mlp: bool = False
+    y_mlp_depth: int = 3
 
 class GPT(nn.Module):
 
@@ -167,6 +179,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        assert not (config.y_transformer and config.y_mlp), "Cannot use y_transformer and y_mlp simultaneously"
         if config.y_transformer:
             y_config = copy.deepcopy(config)
             y_config.cross_encode=False
@@ -178,6 +191,8 @@ class GPT(nn.Module):
                 h = nn.ModuleList([Block(y_config) for _ in range(n_y_layers)]),
                 ln_f = LayerNorm(config.n_embd, bias=config.bias),
             ))
+        if config.y_mlp:
+            self.y_mlp = nn.ModuleList([MLPBlock(config) for _ in range(config.n_layer)])
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -233,14 +248,17 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         for i,block in enumerate(self.transformer.h):
             kv_cache_i = kv_cache[i] if kv_cache else None
-            if self.config.cross_encode or self.config.y_transformer:
+            if self.config.cross_encode or self.config.y_transformer or self.config.y_mlp:
                 interm_embed = xa_cache[i] if xa_cache else None
             else:
                 interm_embed = kv_cache[self.config.interm_layer_idx] if kv_cache else None
                 if interm_embed is not None:
                     interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
-            
-            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,xa_in)
+            if self.config.y_mlp and xa_in is not None:
+                new_interm = xa_in[i]
+            else:
+                new_interm = xa_in
+            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm)
             attn_weights.append(weights)
             new_kv.append(torch.cat(kv).clone().detach()) 
             if xa[0] is not None:
@@ -258,6 +276,12 @@ class GPT(nn.Module):
                 new_y_kv.append(torch.cat(kv).clone().detach()) 
             y = self.y_transformer.ln_f(y)
             new_interm_embed = y
+        if self.config.y_mlp:
+            y = new_interm_embed
+            new_interm_embed = []
+            for block in self.y_mlp:
+                embed_i = block(y)
+                new_interm_embed.append(embed_i) 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)

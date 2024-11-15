@@ -42,6 +42,8 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 window_training = False
 y_transformer=False
+y_mlp=False
+y_mlp_depth=3
 cross_encode=False
 window_size = None
 interm_layer_idx = None
@@ -155,7 +157,8 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
-                  interm_layer_idx=interm_layer_idx,cross_encode=cross_encode,y_transformer=y_transformer) # start with model_args from command line
+                  interm_layer_idx=interm_layer_idx,cross_encode=cross_encode,
+                  y_transformer=y_transformer,y_mlp=y_mlp,y_mlp_depth=y_mlp_depth) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
