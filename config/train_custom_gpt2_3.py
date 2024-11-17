@@ -4,7 +4,7 @@
 
 wandb_log = True
 wandb_project = 'owt'
-wandb_run_name='mlp_7_3'
+wandb_run_name='custom_7_fix_ycache'
 log_grad = True
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
@@ -12,8 +12,8 @@ batch_size = 16
 block_size = 1024
 window_training=True
 cross_encode=True
-#y_transformer=True
-y_mlp=True
+y_transformer=True
+y_mlp=False
 y_mlp_depth=3
 window_size = 128
 interm_layer_idx = 7

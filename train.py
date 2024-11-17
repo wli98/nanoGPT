@@ -41,6 +41,7 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 window_training = False
+attend_embed = False
 y_transformer=False
 y_mlp=False
 y_mlp_depth=3
@@ -158,7 +159,8 @@ if os.path.exists(meta_path):
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
                   interm_layer_idx=interm_layer_idx,cross_encode=cross_encode,
-                  y_transformer=y_transformer,y_mlp=y_mlp,y_mlp_depth=y_mlp_depth) # start with model_args from command line
+                  y_transformer=y_transformer,y_mlp=y_mlp,y_mlp_depth=y_mlp_depth,
+                  attend_embed=attend_embed) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -429,8 +431,8 @@ while True:
            for i,pair in enumerate(weights):
                 wandb.log({
                 "iter": iter_num,
-                f"weight_{i}/xa": pair[0].item(),
-                f"weight_{i}/kv": pair[1].item(),
+                f"weight_{i}/xa": pair[0].item() if isinstance(pair[0],torch.Tensor) else pair[0],
+                f"weight_{i}/kv": pair[1].item() if isinstance(pair[1],torch.Tensor) else pair[1],
             })
 
     iter_num += 1

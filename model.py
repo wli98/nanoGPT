@@ -158,6 +158,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     window_training: bool = False
+    attend_embed: bool = False
     interm_layer_idx: int = 8
     cross_encode: bool = False
     y_transformer: bool = False
@@ -199,7 +200,7 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-        if self.config.window_training and not self.config.cross_encode:
+        if self.config.window_training and not self.config.cross_encode and self.config.attend_embed:
             self.wie = nn.Parameter(torch.zeros(config.n_head,config.n_embd//config.n_head))
         # init all weights
         self.apply(self._init_weights)
@@ -250,20 +251,24 @@ class GPT(nn.Module):
             kv_cache_i = kv_cache[i] if kv_cache else None
             if self.config.cross_encode or self.config.y_transformer or self.config.y_mlp:
                 interm_embed = xa_cache[i] if xa_cache else None
-            else:
+            elif self.config.attend_embed:
                 interm_embed = kv_cache[self.config.interm_layer_idx] if kv_cache else None
                 if interm_embed is not None:
                     interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
+            else:
+                interm_embed=None
             if self.config.y_mlp and xa_in is not None:
                 new_interm = xa_in[i]
             else:
                 new_interm = xa_in
             x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm)
             attn_weights.append(weights)
-            new_kv.append(torch.cat(kv).clone().detach()) 
+            #new_kv.append(torch.cat(kv).clone().detach()) 
+            new_kv.append(torch.cat(kv)) 
+
             if xa[0] is not None:
                 new_xa.append(torch.cat(xa).clone().detach())
-            if i == self.config.interm_layer_idx:
+            if i == self.config.interm_layer_idx and self.config.attend_embed:
                 new_interm_embed = x
         x = self.transformer.ln_f(x)
         
@@ -273,7 +278,7 @@ class GPT(nn.Module):
             for i,block in enumerate(self.y_transformer.h):
                 y_cache_i = y_cache[i] if y_cache else None
                 y,y_kv,_,_ = block(y,y_cache_i)
-                new_y_kv.append(torch.cat(kv).clone().detach()) 
+                new_y_kv.append(torch.cat(y_kv).clone().detach()) 
             y = self.y_transformer.ln_f(y)
             new_interm_embed = y
         if self.config.y_mlp:
