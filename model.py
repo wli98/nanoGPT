@@ -53,7 +53,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x,kv=None,xa=None,new_xa=None):
+    def forward(self, x,kv=None,xa=None,new_xa=None,mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -74,8 +74,8 @@ class CausalSelfAttention(nn.Module):
         new_k,new_v = None,None
         if new_xa is not None:
             new_k,new_v = self.c_encode(new_xa).split(self.n_embd,dim=2)
-            new_k = new_k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            new_v = new_v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            new_k = new_k.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            new_v = new_v.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             combined_k  = torch.cat([new_k,combined_k],dim=2)
             combined_v = torch.cat([new_v,combined_v],dim=2)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
@@ -88,10 +88,15 @@ class CausalSelfAttention(nn.Module):
                     prev_len = (combined_k.shape[2]-q.shape[2])//2
                     xa_weight = attn_mat[:,:,:,:prev_len].mean()
                     kv_weight = attn_mat[:,:,:,prev_len:2*prev_len].mean()
-                attn_bias = causal_lower_right(q.shape[2], k.shape[2])
+                attn_bias = causal_lower_right(q.shape[2], combined_k.shape[2])
+                #size= (q.shape[2],combined_k.shape[2])
+                #attn_bias=mask
                 y = torch.nn.functional.scaled_dot_product_attention(q, combined_k, combined_v, attn_mask=attn_bias, dropout_p=self.dropout if self.training else 0, is_causal=False)
             else:
+                #mask = torch.tril(torch.ones(q.shape[2],q.shape[2])).to(dtype=bool,device=q.device)
+                #y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0, is_causal=False)
                 y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+
         else:
             if kv is not None:
                 raise Exception("need to implement lower right bias for kv cache")
@@ -142,11 +147,33 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x,kv=None,xa=None,new_xa=None):
-        y,kv,xa,weights = self.attn(self.ln_1(x),kv=kv,xa=xa,new_xa=new_xa)
+    def forward(self, x,kv=None,xa=None,new_xa=None,mask=None):
+        y,kv,xa,weights = self.attn(self.ln_1(x),kv=kv,xa=xa,new_xa=new_xa,mask=mask)
         x = x + y 
         x = x + self.mlp(self.ln_2(x))
         return x,kv,xa,weights
+
+class SimpleTransformer(nn.Module):
+    
+    def __init__(self,config):
+        super().__init__()
+        config.cross_encode=False
+        #n_y_layers = config.n_layer-config.interm_layer_idx-1 
+        n_layers = config.n_y_layers
+        self.transformer = nn.ModuleDict(dict(
+            #wte = nn.Embedding(config.vocab_size, config.n_embd),
+            #wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config) for _ in range(n_layers)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+    
+    def forward(self,x):
+        for i,block in enumerate(self.transformer.h):
+            x,_,_,_ = block(x)
+            #new_y_kv.append(torch.cat(y_kv).clone().detach()) 
+        x = self.transformer.ln_f(x)
+        return x
 
 @dataclass
 class GPTConfig:
@@ -158,11 +185,14 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     window_training: bool = False
+    attend_embed: bool = False
     interm_layer_idx: int = 8
+    n_y_layers: int  = 0
     cross_encode: bool = False
     y_transformer: bool = False
     y_mlp: bool = False
     y_mlp_depth: int = 3
+    pause_stage: int = 0
 
 class GPT(nn.Module):
 
@@ -183,7 +213,8 @@ class GPT(nn.Module):
         if config.y_transformer:
             y_config = copy.deepcopy(config)
             y_config.cross_encode=False
-            n_y_layers = config.n_layer-config.interm_layer_idx-1 
+            #n_y_layers = config.n_layer-config.interm_layer_idx-1 
+            n_y_layers = config.n_y_layers
             self.y_transformer = nn.ModuleDict(dict(
                 #wte = nn.Embedding(config.vocab_size, config.n_embd),
                 #wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -193,14 +224,20 @@ class GPT(nn.Module):
             ))
         if config.y_mlp:
             self.y_mlp = nn.ModuleList([MLPBlock(config) for _ in range(config.n_layer)])
+        if config.pause_stage > 0:
+            p_config = copy.deepcopy(config)
+            #n_y_layers = config.n_layer-config.interm_layer_idx-1 
+            n_layers = config.n_y_layers
+            self.p_transformer = SimpleTransformer(p_config) 
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-        if self.config.window_training and not self.config.cross_encode:
-            self.wie = nn.Parameter(torch.zeros(config.n_head,config.n_embd//config.n_head))
+        #if self.config.window_training and not self.config.cross_encode and self.config.attend_embed:
+            #self.wie = nn.Parameter(torch.zeros(config.n_head,config.n_embd//config.n_head))
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -231,12 +268,14 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None):
+    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None,i=0,window_size=0,tokenpos=None,p_forward=False,p_forward_x=None,rearranged_pause_idcs=None,p_embeddings=None,mask=None):
+        if p_forward:
+            return self.p_transformer(p_forward_x)
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
+        pos = pos+ i*window_size if tokenpos is None else torch.Tensor([tokenpos]).long().to(device)
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
@@ -246,25 +285,34 @@ class GPT(nn.Module):
         attn_weights = []
         new_interm_embed = None
         x = self.transformer.drop(tok_emb + pos_emb)
+        if rearranged_pause_idcs is not None:
+            x.scatter_(1,rearranged_pause_idcs.unsqueeze(-1).repeat(1,1,self.config.n_embd),p_embeddings)
         for i,block in enumerate(self.transformer.h):
             kv_cache_i = kv_cache[i] if kv_cache else None
             if self.config.cross_encode or self.config.y_transformer or self.config.y_mlp:
                 interm_embed = xa_cache[i] if xa_cache else None
-            else:
+            elif self.config.attend_embed:
                 interm_embed = kv_cache[self.config.interm_layer_idx] if kv_cache else None
-                if interm_embed is not None:
-                    interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
+                #if interm_embed is not None:
+                #    interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
+            else:
+                interm_embed=None
             if self.config.y_mlp and xa_in is not None:
                 new_interm = xa_in[i]
             else:
                 new_interm = xa_in
-            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm)
+            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm,mask=None)
             attn_weights.append(weights)
-            new_kv.append(torch.cat(kv).clone().detach()) 
+            #new_kv.append(torch.cat(kv).clone().detach()) 
+            new_kv.append(torch.cat(kv)) 
+
             if xa[0] is not None:
-                new_xa.append(torch.cat(xa).clone().detach())
-            if i == self.config.interm_layer_idx:
-                new_interm_embed = x
+                #new_xa.append(torch.cat(xa).clone().detach())
+                new_xa.append(torch.cat(xa))
+            if i == self.config.interm_layer_idx and self.config.attend_embed:
+                #new_interm_embed = x
+                new_interm_embed = x.clone().detach()
+
         x = self.transformer.ln_f(x)
         
         new_y_kv=[]
@@ -273,7 +321,9 @@ class GPT(nn.Module):
             for i,block in enumerate(self.y_transformer.h):
                 y_cache_i = y_cache[i] if y_cache else None
                 y,y_kv,_,_ = block(y,y_cache_i)
-                new_y_kv.append(torch.cat(kv).clone().detach()) 
+                #new_y_kv.append(torch.cat(y_kv).clone().detach()) 
+                new_y_kv.append(torch.cat(y_kv)) 
+
             y = self.y_transformer.ln_f(y)
             new_interm_embed = y
         if self.config.y_mlp:
@@ -291,7 +341,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed, attn_weights
+        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed, attn_weights,x
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -429,3 +479,97 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+    
+    @torch.no_grad()
+    def generate_loop(self, idx, max_new_tokens, temperature=1.0, top_k=None,window_size=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        tokens = []
+        input_splits = torch.split(idx,window_size,dim=1)
+        kv_cache = None 
+        xa_cache = None
+        y_cache = None
+        interm_embed = None
+        full_interm_embed = None
+        for i,input_block in enumerate(input_splits):
+            input_block_len = input_block.shape[1]
+            logits,loss,kv,xa,y,interm_embed,_ = self(input_block,None,kv_cache,xa_cache,interm_embed,y_cache,i,window_size) 
+            if kv_cache is None:
+                kv_cache = kv 
+            else:
+                for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
+                    kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+            if xa_cache is None:
+                xa_cache = []
+            elif len(xa_cache) == 0:
+                xa_cache = xa
+            elif isinstance(xa_cache,list): 
+                for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
+                    xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
+            if y_cache is None:
+                y_cache = y
+            else: 
+                for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
+                    y_cache[i] = torch.cat([old_y,new_y],dim=2)
+            if input_block_len == window_size:
+                full_interm_embed = interm_embed
+        logits = logits[:, -1, :] / temperature
+        # optionally crop the logits to only the top k options
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+        # apply softmax to convert logits to (normalized) probabilities
+        probs = F.softmax(logits, dim=-1)
+        # sample from the distribution
+        last_idx = torch.multinomial(probs, num_samples=1)
+        tokens.append(last_idx.item())
+        
+        token_count = 0
+        remaining_block = window_size-input_block_len-1
+        interm_embed_list = [interm_embed]
+        input_len = idx.shape[1]
+        while token_count < max_new_tokens:
+            if remaining_block == 0:
+                full_interm_embed = torch.cat(interm_embed_list,dim=1)
+                interm_embed_list = []
+                
+            logits,loss,kv,xa,y,interm_embed,_ = self(last_idx,None,kv_cache,xa_cache,full_interm_embed,y_cache,i,window_size,tokenpos=input_len+len(tokens)-1) 
+            if remaining_block == 0:
+                if len(xa_cache)>0:
+                    for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
+                        xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
+                remaining_block = window_size
+
+            if kv_cache is None:
+                kv_cache = kv 
+            else:
+                for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
+                    kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+            if xa_cache is None:
+                xa_cache = []
+            elif len(xa_cache) == 0:
+                xa_cache = xa
+            if y_cache is None:
+                y_cache = y
+            else: 
+                for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
+                    y_cache[i] = torch.cat([old_y,new_y],dim=2)
+            interm_embed_list.append(interm_embed)
+            
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            last_idx = torch.multinomial(probs, num_samples=1)
+            tokens.append(last_idx.item()) 
+            remaining_block -= 1 
+            token_count += 1 
+        
+        return tokens 
