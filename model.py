@@ -200,8 +200,8 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-        if self.config.window_training and not self.config.cross_encode and self.config.attend_embed:
-            self.wie = nn.Parameter(torch.zeros(config.n_head,config.n_embd//config.n_head))
+        #if self.config.window_training and not self.config.cross_encode and self.config.attend_embed:
+            #self.wie = nn.Parameter(torch.zeros(config.n_head,config.n_embd//config.n_head))
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -253,8 +253,8 @@ class GPT(nn.Module):
                 interm_embed = xa_cache[i] if xa_cache else None
             elif self.config.attend_embed:
                 interm_embed = kv_cache[self.config.interm_layer_idx] if kv_cache else None
-                if interm_embed is not None:
-                    interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
+                #if interm_embed is not None:
+                #    interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
             else:
                 interm_embed=None
             if self.config.y_mlp and xa_in is not None:
@@ -263,8 +263,8 @@ class GPT(nn.Module):
                 new_interm = xa_in
             x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm)
             attn_weights.append(weights)
-            #new_kv.append(torch.cat(kv).clone().detach()) 
-            new_kv.append(torch.cat(kv)) 
+            new_kv.append(torch.cat(kv).clone().detach()) 
+            #new_kv.append(torch.cat(kv)) 
 
             if xa[0] is not None:
                 new_xa.append(torch.cat(xa).clone().detach())

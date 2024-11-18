@@ -11,6 +11,7 @@ log_grad = True
 batch_size = 16
 block_size = 1024
 window_training=True
+attend_embed=True
 cross_encode=True
 y_transformer=True
 y_mlp=False
