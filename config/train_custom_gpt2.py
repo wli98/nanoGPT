@@ -4,13 +4,13 @@
 
 wandb_log = True
 wandb_project = 'owt'
-wandb_run_name='baseline_nodetach'
+wandb_run_name='baseline_nowindow_fixlr'
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 12
+batch_size = 16
 block_size = 1024
-window_training=True
+window_training=False
 attend_embed=False
 window_size = 128
 interm_layer_idx = 8
