@@ -22,6 +22,7 @@ import math
 import pickle
 from contextlib import nullcontext
 from tqdm import tqdm
+from torchviz import make_dot
 
 import numpy as np
 import torch
@@ -83,6 +84,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+#dtype = 'float32'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -243,8 +245,8 @@ def estimate_loss():
                     xa_cache = None
                     y_cache = None
                     interm_embed = None
-                    for win_X,win_Y in zip(split_X,split_Y):
-                        logits,loss,kv,xa,y,interm_embed,_ = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache) 
+                    for i,(win_X,win_Y) in enumerate(zip(split_X,split_Y)):
+                        logits,loss,kv,xa,y,interm_embed,_ = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache,i,window_size) 
                         if kv_cache is None:
                             kv_cache = kv 
                         else:
@@ -292,11 +294,13 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
+#torch.autograd.set_detect_anomaly(True)
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+model.train()
 while True:
 
     # determine and set the learning rate for this iteration
@@ -315,7 +319,7 @@ while True:
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            },step=iter_num)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -348,12 +352,12 @@ while True:
                 kv_cache = None
                 xa_cache = None
                 y_cache =None
-                loss = 0
-                for win_X,win_Y in zip(split_X,split_Y):
+                loss = []
+                for win_idx,(win_X,win_Y) in enumerate(zip(split_X,split_Y)):
                     #logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
-                    logits,mini_loss,kv,xa,y,interm_embed,weights = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache) 
-
-                    loss += mini_loss
+                    logits,mini_loss,kv,xa,y,interm_embed,weights = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache,win_idx,window_size) 
+                    #loss += mini_loss
+                    loss.append(mini_loss)
                     if kv_cache is None:
                         kv_cache = kv 
                     else:
@@ -371,15 +375,29 @@ while True:
                     else: 
                         for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
                             y_cache[i] = torch.cat([old_y,new_y],dim=2)
-
+                    #scaler.scale(mini_loss).backward(retain_graph=True)
+                    #if win_idx == 1:
+                #dot = make_dot(total_loss, params=dict(model.named_parameters()))
+                # Save to file
+                #dot.render(f"autograd_graph_torchviz_total_loss", format="png")
 
             else:
-                logits, loss,_,_,_,_,weights = model(X, Y)
+                logits, loss,_,_,_,_,weights = model(X, Y,i=0,window_size=block_size)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+                total_loss = loss.item()
+                #dot = make_dot(loss, params=dict(model.named_parameters()))
+                # Save to file
+                #dot.render(f"autograd_graph_torchviz_nowindow", format="png")
+                #scaler.scale(loss).backward()
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+        if window_training:
+            num_splits = len(split_X)
+            total_loss = sum(loss)/num_splits
+            scaler.scale(total_loss).backward()
+        else:
+            scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
@@ -397,7 +415,7 @@ while True:
             wandb.log({
                 "iter": iter_num,
                 f"grad/layer {i}": total_norm
-            })
+            },step=iter_num)
         if hasattr(model.module,"y_transformer"):
             for i,layer in enumerate(model.module.y_transformer.h):
                 total_norm = 0
@@ -407,7 +425,7 @@ while True:
                 wandb.log({
                     "iter": iter_num,
                     f"grad/y_layer {i}": total_norm
-                })
+                },step=iter_num)
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -418,7 +436,8 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
+        #lossf = loss.item() * gradient_accumulation_steps
+        lossf = total_loss * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
@@ -427,13 +446,14 @@ while True:
            wandb.log({
                 "iter": iter_num,
                 "train_log/loss": lossf,
-            })
+                "train_log/lr":lr
+            },step=iter_num)
            for i,pair in enumerate(weights):
                 wandb.log({
                 "iter": iter_num,
                 f"weight_{i}/xa": pair[0].item() if isinstance(pair[0],torch.Tensor) else pair[0],
                 f"weight_{i}/kv": pair[1].item() if isinstance(pair[1],torch.Tensor) else pair[1],
-            })
+            },step=iter_num)
 
     iter_num += 1
     local_iter_num += 1

@@ -53,7 +53,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x,kv=None,xa=None,new_xa=None):
+    def forward(self, x,kv=None,xa=None,new_xa=None,mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -88,10 +88,15 @@ class CausalSelfAttention(nn.Module):
                     prev_len = (combined_k.shape[2]-q.shape[2])//2
                     xa_weight = attn_mat[:,:,:,:prev_len].mean()
                     kv_weight = attn_mat[:,:,:,prev_len:2*prev_len].mean()
-                attn_bias = causal_lower_right(q.shape[2], k.shape[2])
+                #cause_attn_bias = causal_lower_right(q.shape[2], combined_k.shape[2])
+                size= (q.shape[2],combined_k.shape[2])
+                attn_bias=mask
                 y = torch.nn.functional.scaled_dot_product_attention(q, combined_k, combined_v, attn_mask=attn_bias, dropout_p=self.dropout if self.training else 0, is_causal=False)
             else:
+                #mask = torch.tril(torch.ones(q.shape[2],q.shape[2])).to(dtype=bool,device=q.device)
+                #y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0, is_causal=False)
                 y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+
         else:
             if kv is not None:
                 raise Exception("need to implement lower right bias for kv cache")
@@ -142,8 +147,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x,kv=None,xa=None,new_xa=None):
-        y,kv,xa,weights = self.attn(self.ln_1(x),kv=kv,xa=xa,new_xa=new_xa)
+    def forward(self, x,kv=None,xa=None,new_xa=None,mask=None):
+        y,kv,xa,weights = self.attn(self.ln_1(x),kv=kv,xa=xa,new_xa=new_xa,mask=mask)
         x = x + y 
         x = x + self.mlp(self.ln_2(x))
         return x,kv,xa,weights
@@ -232,12 +237,12 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None):
+    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None,i=0,window_size=0):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
+        pos = pos+ i*window_size
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
@@ -247,6 +252,12 @@ class GPT(nn.Module):
         attn_weights = []
         new_interm_embed = None
         x = self.transformer.drop(tok_emb + pos_emb)
+        attn_size = (window_size,(i+1)*window_size)
+        diagonal_offset = (i+1)*window_size - window_size
+        attn_bias= torch.tril(
+            torch.ones(attn_size, dtype=torch.bool),
+            diagonal=diagonal_offset,
+        ).unsqueeze(0).to(idx.device)		  
         for i,block in enumerate(self.transformer.h):
             kv_cache_i = kv_cache[i] if kv_cache else None
             if self.config.cross_encode or self.config.y_transformer or self.config.y_mlp:
@@ -261,10 +272,10 @@ class GPT(nn.Module):
                 new_interm = xa_in[i]
             else:
                 new_interm = xa_in
-            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm)
+            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm,mask=attn_bias)
             attn_weights.append(weights)
-            new_kv.append(torch.cat(kv).clone().detach()) 
-            #new_kv.append(torch.cat(kv)) 
+            #new_kv.append(torch.cat(kv).clone().detach()) 
+            new_kv.append(torch.cat(kv)) 
 
             if xa[0] is not None:
                 new_xa.append(torch.cat(xa).clone().detach())
