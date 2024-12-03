@@ -88,9 +88,9 @@ class CausalSelfAttention(nn.Module):
                     prev_len = (combined_k.shape[2]-q.shape[2])//2
                     xa_weight = attn_mat[:,:,:,:prev_len].mean()
                     kv_weight = attn_mat[:,:,:,prev_len:2*prev_len].mean()
-                #cause_attn_bias = causal_lower_right(q.shape[2], combined_k.shape[2])
-                size= (q.shape[2],combined_k.shape[2])
-                attn_bias=mask
+                attn_bias = causal_lower_right(q.shape[2], combined_k.shape[2])
+                #size= (q.shape[2],combined_k.shape[2])
+                #attn_bias=mask
                 y = torch.nn.functional.scaled_dot_product_attention(q, combined_k, combined_v, attn_mask=attn_bias, dropout_p=self.dropout if self.training else 0, is_causal=False)
             else:
                 #mask = torch.tril(torch.ones(q.shape[2],q.shape[2])).to(dtype=bool,device=q.device)
@@ -165,6 +165,7 @@ class GPTConfig:
     window_training: bool = False
     attend_embed: bool = False
     interm_layer_idx: int = 8
+    n_y_layers: int  = 0
     cross_encode: bool = False
     y_transformer: bool = False
     y_mlp: bool = False
@@ -189,7 +190,8 @@ class GPT(nn.Module):
         if config.y_transformer:
             y_config = copy.deepcopy(config)
             y_config.cross_encode=False
-            n_y_layers = config.n_layer-config.interm_layer_idx-1 
+            #n_y_layers = config.n_layer-config.interm_layer_idx-1 
+            n_y_layers = config.n_y_layers
             self.y_transformer = nn.ModuleDict(dict(
                 #wte = nn.Embedding(config.vocab_size, config.n_embd),
                 #wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -252,12 +254,14 @@ class GPT(nn.Module):
         attn_weights = []
         new_interm_embed = None
         x = self.transformer.drop(tok_emb + pos_emb)
+        '''
         attn_size = (window_size,(i+1)*window_size)
         diagonal_offset = (i+1)*window_size - window_size
         attn_bias= torch.tril(
             torch.ones(attn_size, dtype=torch.bool),
             diagonal=diagonal_offset,
         ).unsqueeze(0).to(idx.device)		  
+        '''
         for i,block in enumerate(self.transformer.h):
             kv_cache_i = kv_cache[i] if kv_cache else None
             if self.config.cross_encode or self.config.y_transformer or self.config.y_mlp:
@@ -272,15 +276,18 @@ class GPT(nn.Module):
                 new_interm = xa_in[i]
             else:
                 new_interm = xa_in
-            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm,mask=attn_bias)
+            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm,mask=None)
             attn_weights.append(weights)
             #new_kv.append(torch.cat(kv).clone().detach()) 
             new_kv.append(torch.cat(kv)) 
 
             if xa[0] is not None:
-                new_xa.append(torch.cat(xa).clone().detach())
+                #new_xa.append(torch.cat(xa).clone().detach())
+                new_xa.append(torch.cat(xa))
             if i == self.config.interm_layer_idx and self.config.attend_embed:
-                new_interm_embed = x
+                #new_interm_embed = x
+                new_interm_embed = x.clone().detach()
+
         x = self.transformer.ln_f(x)
         
         new_y_kv=[]
@@ -289,7 +296,9 @@ class GPT(nn.Module):
             for i,block in enumerate(self.y_transformer.h):
                 y_cache_i = y_cache[i] if y_cache else None
                 y,y_kv,_,_ = block(y,y_cache_i)
-                new_y_kv.append(torch.cat(y_kv).clone().detach()) 
+                #new_y_kv.append(torch.cat(y_kv).clone().detach()) 
+                new_y_kv.append(torch.cat(y_kv)) 
+
             y = self.y_transformer.ln_f(y)
             new_interm_embed = y
         if self.config.y_mlp:

@@ -49,6 +49,7 @@ y_mlp_depth=3
 cross_encode=False
 window_size = None
 interm_layer_idx = None
+n_y_layers = None
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -162,7 +163,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
                   interm_layer_idx=interm_layer_idx,cross_encode=cross_encode,
                   y_transformer=y_transformer,y_mlp=y_mlp,y_mlp_depth=y_mlp_depth,
-                  attend_embed=attend_embed) # start with model_args from command line
+                  n_y_layers=n_y_layers,attend_embed=attend_embed) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
