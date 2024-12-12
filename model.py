@@ -74,8 +74,8 @@ class CausalSelfAttention(nn.Module):
         new_k,new_v = None,None
         if new_xa is not None:
             new_k,new_v = self.c_encode(new_xa).split(self.n_embd,dim=2)
-            new_k = new_k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            new_v = new_v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            new_k = new_k.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            new_v = new_v.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             combined_k  = torch.cat([new_k,combined_k],dim=2)
             combined_v = torch.cat([new_v,combined_v],dim=2)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
@@ -239,12 +239,12 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None,i=0,window_size=0):
+    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None,i=0,window_size=0,tokenpos=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-        pos = pos+ i*window_size
+        pos = pos+ i*window_size if tokenpos is None else torch.Tensor([tokenpos]).long().to(device)
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
@@ -454,3 +454,97 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+    
+    @torch.no_grad()
+    def generate_loop(self, idx, max_new_tokens, temperature=1.0, top_k=None,window_size=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        tokens = []
+        input_splits = torch.split(idx,window_size,dim=1)
+        kv_cache = None 
+        xa_cache = None
+        y_cache = None
+        interm_embed = None
+        full_interm_embed = None
+        for i,input_block in enumerate(input_splits):
+            input_block_len = input_block.shape[1]
+            logits,loss,kv,xa,y,interm_embed,_ = self(input_block,None,kv_cache,xa_cache,interm_embed,y_cache,i,window_size) 
+            if kv_cache is None:
+                kv_cache = kv 
+            else:
+                for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
+                    kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+            if xa_cache is None:
+                xa_cache = []
+            elif len(xa_cache) == 0:
+                xa_cache = xa
+            elif isinstance(xa_cache,list): 
+                for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
+                    xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
+            if y_cache is None:
+                y_cache = y
+            else: 
+                for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
+                    y_cache[i] = torch.cat([old_y,new_y],dim=2)
+            if input_block_len == window_size:
+                full_interm_embed = interm_embed
+        logits = logits[:, -1, :] / temperature
+        # optionally crop the logits to only the top k options
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+        # apply softmax to convert logits to (normalized) probabilities
+        probs = F.softmax(logits, dim=-1)
+        # sample from the distribution
+        last_idx = torch.multinomial(probs, num_samples=1)
+        tokens.append(last_idx.item())
+        
+        token_count = 0
+        remaining_block = window_size-input_block_len-1
+        interm_embed_list = [interm_embed]
+        input_len = idx.shape[1]
+        while token_count < max_new_tokens:
+            if remaining_block == 0:
+                full_interm_embed = torch.cat(interm_embed_list,dim=1)
+                interm_embed_list = []
+                
+            logits,loss,kv,xa,y,interm_embed,_ = self(last_idx,None,kv_cache,xa_cache,full_interm_embed,y_cache,i,window_size,tokenpos=input_len+len(tokens)-1) 
+            if remaining_block == 0:
+                if len(xa_cache)>0:
+                    for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
+                        xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
+                remaining_block = window_size
+
+            if kv_cache is None:
+                kv_cache = kv 
+            else:
+                for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
+                    kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
+            if xa_cache is None:
+                xa_cache = []
+            elif len(xa_cache) == 0:
+                xa_cache = xa
+            if y_cache is None:
+                y_cache = y
+            else: 
+                for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
+                    y_cache[i] = torch.cat([old_y,new_y],dim=2)
+            interm_embed_list.append(interm_embed)
+            
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            last_idx = torch.multinomial(probs, num_samples=1)
+            tokens.append(last_idx.item()) 
+            remaining_block -= 1 
+            token_count += 1 
+        
+        return tokens 

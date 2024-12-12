@@ -11,6 +11,13 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
+y_transformer=False
+y_mlp=False
+y_mlp_depth=3
+cross_encode=False
+window_size = None
+interm_layer_idx = None
+n_y_layers = None
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -81,9 +88,19 @@ start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+if model.config.window_training:
+    with torch.no_grad():
+        with ctx:
+            for k in range(num_samples):
+                y = model.generate_loop(x, max_new_tokens, temperature=temperature, top_k=top_k,window_size=window_size)
+                output_str = decode(y)
+                #print(decode(y[0].tolist()))
+                print(decode(y))
+                print('---------------')
+else:
+    with torch.no_grad():
+        with ctx:
+            for k in range(num_samples):
+                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                print(decode(y[0].tolist()))
+                print('---------------')
