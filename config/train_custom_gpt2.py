@@ -4,7 +4,7 @@
 
 wandb_log = False
 wandb_project = 'owt'
-wandb_run_name='baseline_nowindow_5e5_nolograd'
+wandb_run_name='baseline'
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
@@ -15,7 +15,7 @@ window_training=False
 attend_embed=False
 window_size = 128
 interm_layer_idx = 8
-pause_stage = 1
+pause_stage = 0
 n_y_layers = 3
 
 gradient_accumulation_steps = 1

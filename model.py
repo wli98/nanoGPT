@@ -341,7 +341,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed, attn_weights,x
+        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed, attn_weights
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
