@@ -153,6 +153,28 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x,kv,xa,weights
 
+class SimpleTransformer(nn.Module):
+    
+    def __init__(self,config):
+        super().__init__()
+        config.cross_encode=False
+        #n_y_layers = config.n_layer-config.interm_layer_idx-1 
+        n_layers = config.n_y_layers
+        self.transformer = nn.ModuleDict(dict(
+            #wte = nn.Embedding(config.vocab_size, config.n_embd),
+            #wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config) for _ in range(n_layers)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+    
+    def forward(self,x):
+        for i,block in enumerate(self.transformer.h):
+            x,_,_,_ = block(x)
+            #new_y_kv.append(torch.cat(y_kv).clone().detach()) 
+        x = self.transformer.ln_f(x)
+        return x
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -203,8 +225,11 @@ class GPT(nn.Module):
         if config.y_mlp:
             self.y_mlp = nn.ModuleList([MLPBlock(config) for _ in range(config.n_layer)])
         if config.pause_stage > 0:
-            self.pause_mlp = nn.ModuleList([MLPBlock(config) for _ in range(config.n_y_layers)])
- 
+            p_config = copy.deepcopy(config)
+            #n_y_layers = config.n_layer-config.interm_layer_idx-1 
+            n_layers = config.n_y_layers
+            self.p_transformer = SimpleTransformer(p_config) 
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -243,7 +268,9 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None,i=0,window_size=0,tokenpos=None):
+    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None,i=0,window_size=0,tokenpos=None,p_forward=False,p_forward_x=None,rearranged_pause_idcs=None,p_embeddings=None,mask=None):
+        if p_forward:
+            return self.p_transformer(p_forward_x)
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -258,14 +285,8 @@ class GPT(nn.Module):
         attn_weights = []
         new_interm_embed = None
         x = self.transformer.drop(tok_emb + pos_emb)
-        '''
-        attn_size = (window_size,(i+1)*window_size)
-        diagonal_offset = (i+1)*window_size - window_size
-        attn_bias= torch.tril(
-            torch.ones(attn_size, dtype=torch.bool),
-            diagonal=diagonal_offset,
-        ).unsqueeze(0).to(idx.device)		  
-        '''
+        if rearranged_pause_idcs is not None:
+            x.scatter_(1,rearranged_pause_idcs.unsqueeze(-1).repeat(1,1,self.config.n_embd),p_embeddings)
         for i,block in enumerate(self.transformer.h):
             kv_cache_i = kv_cache[i] if kv_cache else None
             if self.config.cross_encode or self.config.y_transformer or self.config.y_mlp:
@@ -320,7 +341,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed, attn_weights
+        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed, attn_weights,x
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

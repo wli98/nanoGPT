@@ -64,6 +64,7 @@ dataset = 'openwebtext'
 gradient_accumulation_steps = 1 #5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+pos_emb_block_size=2048
 # model
 n_layer = 12
 n_head = 12
@@ -163,7 +164,8 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+model_block_size = block_size if pos_emb_block_size is None else pos_emb_block_size
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=model_block_size,
                   bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
                   interm_layer_idx=interm_layer_idx,cross_encode=cross_encode,
                   y_transformer=y_transformer,y_mlp=y_mlp,y_mlp_depth=y_mlp_depth,
@@ -209,9 +211,11 @@ elif init_from.startswith('gpt2'):
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
+'''
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
+'''
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -273,7 +277,7 @@ def estimate_loss():
                         total_loss += loss
                     loss = loss.mean()
                 else:
-                    logits, loss,_,_,_,_,_ = model(X, Y)
+                    logits, loss,_,_,_,_,_,_ = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -391,42 +395,73 @@ while True:
                         ctx = torch.no_grad()
                         with ctx:
                             seq_len = X.shape[1]
-                            logits, loss,_,_,_,_,weights = model(X, Y,i=0,window_size=block_size)
+                            logits, loss,kv,_,_,_,weights,x = model(X, Y,i=0,window_size=block_size)
                             probs = torch.nn.functional.softmax(logits,dim=-1)    
                             max_prob = probs.max(dim=-1)[0]
                             pause_idcs = torch.where(max_prob<0.8)
                             b_idx,num_pad = torch.unique(pause_idcs[0],return_counts=True) 
                             num_to_pad = [num_pad[torch.where(b_idx==idx)[0].item()] if idx in b_idx else 0 for idx in range(batch_size) ]
-                            max_num_to_pad = max(num_to_pad)
+                            max_num_to_pad = max(num_to_pad).item()
                             max_len = seq_len + max_num_to_pad
                             X_padded = torch.nn.functional.pad(X,(0,max_num_to_pad),value=pause_token)
+                            Y_padded = torch.nn.functional.pad(Y,(0,max_num_to_pad),value=pause_token)
+                            padded_pause_idcs = []
                             rearranged_idcs = []
+                            y_rearranged_idcs = []
+                            rearranged_pause_idcs = []
                             num_pads = []
                             for idx in range(batch_size):
+                                padded_pause_idx = []
+                                rearranged_pause_idx = []
                                 if idx not in b_idx:
                                     row_idcs = [i for i in range(seq_len)] + [max_len-1] * max_num_to_pad 
+                                    y_row_idcs = [i for i in range(seq_len)] + [max_len-1] * max_num_to_pad
+                                    padded_pause_idx = [0] * max_num_to_pad
+                                    rearranged_pause_idx = [max_num_to_pad-1] * max_len 
                                     num_padded = 0
                                 else:
                                     idcs_to_pause = pause_idcs[1][torch.where(pause_idcs[0]==idx)[0]]
                                     row_idcs = [i for i in range(seq_len)]
+                                    y_row_idcs = [i for i in range(seq_len)]
                                     num_padded = 0
                                     for p_idx in idcs_to_pause:
-                                        if p_idx == 0: continue
-                                        row_idcs.insert(p_idx+num_padded,max_len-1)
+                                        #if p_idx == 0: continue
+                                        row_idcs.insert(p_idx.item()+num_padded+1,max_len-1)
+                                        y_row_idcs.insert(p_idx.item()+num_padded,max_len-1)
+                                        padded_pause_idx.append(p_idx.item())
+                                        rearranged_pause_idx.append(p_idx.item()+num_padded+1)
                                         num_padded += 1
                                 num_pads.append(num_padded)
                                 row_idcs = row_idcs + [max_len-1] * (max_len-len(row_idcs))
                                 rearranged_idcs.append(row_idcs)
+                                y_row_idcs = y_row_idcs + [max_len-1] * (max_len-len(y_row_idcs))
+                                y_rearranged_idcs.append(y_row_idcs)
+                                rearranged_pause_idx = rearranged_pause_idx + [max_len-1] * (max_num_to_pad-len(rearranged_pause_idx))
+                                rearranged_pause_idcs.append(rearranged_pause_idx)
+                                padded_pause_idx = padded_pause_idx + [0]*(max_num_to_pad-len(padded_pause_idx))
+                                padded_pause_idcs.append(padded_pause_idx)
                             rearranged_idcs = torch.Tensor(rearranged_idcs).to(X.device,dtype=torch.int64)
+                            y_rearranged_idcs = torch.Tensor(y_rearranged_idcs).to(X.device,dtype=torch.int64)
+ 
+                            rearranged_pause_idcs = torch.Tensor(rearranged_pause_idcs).to(X.device,dtype=torch.int64)
+                            padded_pause_idcs = torch.Tensor(padded_pause_idcs).to(X.device,dtype=torch.int64)
+
                             X_with_pad = torch.gather(X_padded,1,rearranged_idcs)
+                            Y_with_pad = torch.gather(Y_padded,1,y_rearranged_idcs)
                             #padding needs to account for different lengths when stage > 1
-                            import pdb; pdb.set_trace()
                             seq_lens = seq_len + torch.Tensor(num_pads)
                             mask = torch.arange(0,max_len).unsqueeze(0).repeat(batch_size,1)
                             mask = mask<seq_lens.unsqueeze(1).repeat(1,max_len)
-                            #mask = /unsq
-                        
-                logits, loss,_,_,_,_,weights = model(X, Y,i=0,window_size=block_size)
+                            num_pads = torch.Tensor(num_pads).to(X.device)
+
+                        p_outputs = model(None,p_forward=True,p_forward_x=x) 
+                        p_embeddings = torch.gather(p_outputs,1,padded_pause_idcs.unsqueeze(-1).repeat(1,1,n_embd))
+                        X = X_with_pad
+                        Y = Y_with_pad
+                else:
+                    rearranged_pause_idcs=padded_pause_idcs=p_embeddings=None
+                import pdb; pdb.set_trace()
+                logits, loss,_,_,_,_,weights = model(X, Y,i=0,window_size=block_size,rearranged_pause_idcs=rearranged_pause_idcs,p_embeddings=p_embeddings,mask=mask)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
                 total_loss = loss.item()
                 #dot = make_dot(loss, params=dict(model.named_parameters()))

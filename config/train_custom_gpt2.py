@@ -10,6 +10,7 @@ wandb_run_name='baseline_nowindow_5e5_nolograd'
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
 batch_size = 16
 block_size = 1024
+pos_emb_block_size = 2049
 window_training=False
 attend_embed=False
 window_size = 128
