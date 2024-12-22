@@ -170,6 +170,7 @@ class GPTConfig:
     y_transformer: bool = False
     y_mlp: bool = False
     y_mlp_depth: int = 3
+    pause_stage: int = 0
 
 class GPT(nn.Module):
 
@@ -201,6 +202,9 @@ class GPT(nn.Module):
             ))
         if config.y_mlp:
             self.y_mlp = nn.ModuleList([MLPBlock(config) for _ in range(config.n_layer)])
+        if config.pause_stage > 0:
+            self.pause_mlp = nn.ModuleList([MLPBlock(config) for _ in range(config.n_y_layers)])
+ 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.

@@ -14,6 +14,8 @@ window_training=False
 attend_embed=False
 window_size = 128
 interm_layer_idx = 8
+pause_stage = 1
+n_y_layers = 3
 
 gradient_accumulation_steps = 1
 

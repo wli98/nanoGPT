@@ -22,7 +22,7 @@ import math
 import pickle
 from contextlib import nullcontext
 from tqdm import tqdm
-from torchviz import make_dot
+#from torchviz import make_dot
 
 import numpy as np
 import torch
@@ -50,6 +50,10 @@ cross_encode=False
 window_size = None
 interm_layer_idx = None
 n_y_layers = None
+pause_stage = 0
+pause_thresh = 0.7
+pause_token = 50257
+
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -163,7 +167,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
                   interm_layer_idx=interm_layer_idx,cross_encode=cross_encode,
                   y_transformer=y_transformer,y_mlp=y_mlp,y_mlp_depth=y_mlp_depth,
-                  n_y_layers=n_y_layers,attend_embed=attend_embed) # start with model_args from command line
+                  n_y_layers=n_y_layers,attend_embed=attend_embed,pause_stage=pause_stage) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -303,7 +307,6 @@ raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 model.train()
 while True:
-
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -383,6 +386,46 @@ while True:
                 #dot.render(f"autograd_graph_torchviz_total_loss", format="png")
 
             else:
+                if pause_stage > 0:
+                    for i in range(pause_stage):
+                        ctx = torch.no_grad()
+                        with ctx:
+                            seq_len = X.shape[1]
+                            logits, loss,_,_,_,_,weights = model(X, Y,i=0,window_size=block_size)
+                            probs = torch.nn.functional.softmax(logits,dim=-1)    
+                            max_prob = probs.max(dim=-1)[0]
+                            pause_idcs = torch.where(max_prob<0.8)
+                            b_idx,num_pad = torch.unique(pause_idcs[0],return_counts=True) 
+                            num_to_pad = [num_pad[torch.where(b_idx==idx)[0].item()] if idx in b_idx else 0 for idx in range(batch_size) ]
+                            max_num_to_pad = max(num_to_pad)
+                            max_len = seq_len + max_num_to_pad
+                            X_padded = torch.nn.functional.pad(X,(0,max_num_to_pad),value=pause_token)
+                            rearranged_idcs = []
+                            num_pads = []
+                            for idx in range(batch_size):
+                                if idx not in b_idx:
+                                    row_idcs = [i for i in range(seq_len)] + [max_len-1] * max_num_to_pad 
+                                    num_padded = 0
+                                else:
+                                    idcs_to_pause = pause_idcs[1][torch.where(pause_idcs[0]==idx)[0]]
+                                    row_idcs = [i for i in range(seq_len)]
+                                    num_padded = 0
+                                    for p_idx in idcs_to_pause:
+                                        if p_idx == 0: continue
+                                        row_idcs.insert(p_idx+num_padded,max_len-1)
+                                        num_padded += 1
+                                num_pads.append(num_padded)
+                                row_idcs = row_idcs + [max_len-1] * (max_len-len(row_idcs))
+                                rearranged_idcs.append(row_idcs)
+                            rearranged_idcs = torch.Tensor(rearranged_idcs).to(X.device,dtype=torch.int64)
+                            X_with_pad = torch.gather(X_padded,1,rearranged_idcs)
+                            #padding needs to account for different lengths when stage > 1
+                            import pdb; pdb.set_trace()
+                            seq_lens = seq_len + torch.Tensor(num_pads)
+                            mask = torch.arange(0,max_len).unsqueeze(0).repeat(batch_size,1)
+                            mask = mask<seq_lens.unsqueeze(1).repeat(1,max_len)
+                            #mask = /unsq
+                        
                 logits, loss,_,_,_,_,weights = model(X, Y,i=0,window_size=block_size)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
                 total_loss = loss.item()
