@@ -277,7 +277,7 @@ def estimate_loss():
                         total_loss += loss
                     loss = loss.mean()
                 else:
-                    logits, loss,_,_,_,_,_ = model(X, Y)
+                    logits, loss,_,_,_,_,_,x = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -460,7 +460,7 @@ while True:
                         Y = Y_with_pad
                 else:
                     rearranged_pause_idcs=padded_pause_idcs=p_embeddings=mask=None
-                logits, loss,_,_,_,_,weights = model(X, Y,i=0,window_size=block_size,rearranged_pause_idcs=rearranged_pause_idcs,p_embeddings=p_embeddings,mask=mask)
+                logits, loss,_,_,_,_,weights,_ = model(X, Y,i=0,window_size=block_size,rearranged_pause_idcs=rearranged_pause_idcs,p_embeddings=p_embeddings,mask=mask)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
                 total_loss = loss.item()
                 #dot = make_dot(loss, params=dict(model.named_parameters()))
