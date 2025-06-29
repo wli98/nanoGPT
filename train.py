@@ -48,7 +48,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 log_grad = False
 # data
-dataset = 'openwebtext'
+dataset_dir = '/home/ubuntu/ca/data'
 gradient_accumulation_steps = 1 #5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -121,7 +121,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+data_dir = dataset_dir
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -238,6 +238,7 @@ def estimate_loss():
                     kv_cache = None 
                     inp_emb = None
                     for i,(X_tok,Y_tok) in enumerate(zip(X,Y)):
+                        breakpoint() 
                         logits,loss,kv,x = model(idx=X_tok,targets=Y_tok,kv_cache=kv_cache,inp_emb=inp_emb,i=i) 
                         inp_emb = x[:,-1,:]
                         if kv_cache is None:
