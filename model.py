@@ -53,7 +53,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x,kv=None,xa=None,new_xa=None,mask=None):
+    def forward(self, *,x,kv=None,mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -63,31 +63,13 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         if kv is not None:
             k_cache,v_cache = torch.split(kv,kv.shape[0]//2,dim=0)
-            if xa is not None:
-                k_interm, v_interm = torch.split(xa,xa.shape[0]//2,dim=0)
-                combined_k = torch.cat([k_interm,k_cache,k],dim=2)
-                combined_v = torch.cat([v_interm,v_cache,v],dim=2)
-            else:
-                combined_k = torch.cat([k_cache,k],dim=2)
-                combined_v = torch.cat([v_cache,v],dim=2)
- 
-        new_k,new_v = None,None
-        if new_xa is not None:
-            new_k,new_v = self.c_encode(new_xa).split(self.n_embd,dim=2)
-            new_k = new_k.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            new_v = new_v.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            combined_k  = torch.cat([new_k,combined_k],dim=2)
-            combined_v = torch.cat([new_v,combined_v],dim=2)
+            combined_k = torch.cat([k_cache,k],dim=2)
+            combined_v = torch.cat([v_cache,v],dim=2)
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            xa_weight = kv_weight = 0
             if kv is not None:
-                if xa is not None:
-                    attn_mat = (q @ combined_k.transpose(-2, -1))  
-                    prev_len = (combined_k.shape[2]-q.shape[2])//2
-                    xa_weight = attn_mat[:,:,:,:prev_len].mean()
-                    kv_weight = attn_mat[:,:,:,prev_len:2*prev_len].mean()
                 attn_bias = causal_lower_right(q.shape[2], combined_k.shape[2])
                 #size= (q.shape[2],combined_k.shape[2])
                 #attn_bias=mask
@@ -110,7 +92,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y,(k,v), (new_k,new_v), (xa_weight,kv_weight)
+        return y,(k,v)
 
 class MLP(nn.Module):
 
@@ -147,11 +129,11 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x,kv=None,xa=None,new_xa=None,mask=None):
-        y,kv,xa,weights = self.attn(self.ln_1(x),kv=kv,xa=xa,new_xa=new_xa,mask=mask)
+    def forward(self, *,x,kv=None,mask=None):
+        y,kv = self.attn(self.ln_1(x),kv=kv,mask=mask)
         x = x + y 
         x = x + self.mlp(self.ln_2(x))
-        return x,kv,xa,weights
+        return x,kv
 
 class SimpleTransformer(nn.Module):
     
@@ -170,8 +152,7 @@ class SimpleTransformer(nn.Module):
     
     def forward(self,x):
         for i,block in enumerate(self.transformer.h):
-            x,_,_,_ = block(x)
-            #new_y_kv.append(torch.cat(y_kv).clone().detach()) 
+            x,_ = block(x=x)
         x = self.transformer.ln_f(x)
         return x
 
@@ -184,15 +165,6 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    window_training: bool = False
-    attend_embed: bool = False
-    interm_layer_idx: int = 8
-    n_y_layers: int  = 0
-    cross_encode: bool = False
-    y_transformer: bool = False
-    y_mlp: bool = False
-    y_mlp_depth: int = 3
-    pause_stage: int = 0
 
 class GPT(nn.Module):
 
@@ -209,27 +181,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        assert not (config.y_transformer and config.y_mlp), "Cannot use y_transformer and y_mlp simultaneously"
-        if config.y_transformer:
-            y_config = copy.deepcopy(config)
-            y_config.cross_encode=False
-            #n_y_layers = config.n_layer-config.interm_layer_idx-1 
-            n_y_layers = config.n_y_layers
-            self.y_transformer = nn.ModuleDict(dict(
-                #wte = nn.Embedding(config.vocab_size, config.n_embd),
-                #wpe = nn.Embedding(config.block_size, config.n_embd),
-                drop = nn.Dropout(config.dropout),
-                h = nn.ModuleList([Block(y_config) for _ in range(n_y_layers)]),
-                ln_f = LayerNorm(config.n_embd, bias=config.bias),
-            ))
-        if config.y_mlp:
-            self.y_mlp = nn.ModuleList([MLPBlock(config) for _ in range(config.n_layer)])
-        if config.pause_stage > 0:
-            p_config = copy.deepcopy(config)
-            #n_y_layers = config.n_layer-config.interm_layer_idx-1 
-            n_layers = config.n_y_layers
-            self.p_transformer = SimpleTransformer(p_config) 
-
+               
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -268,70 +220,29 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None,kv_cache=None,xa_cache=None,xa_in=None,y_cache=None,i=0,window_size=0,tokenpos=None,p_forward=False,p_forward_x=None,rearranged_pause_idcs=None,p_embeddings=None,mask=None):
-        if p_forward:
-            return self.p_transformer(p_forward_x)
+    def forward(self,*, idx, targets=None,kv_cache=None,inp_emb=None,i=0,tokenpos=None,mask=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-        pos = pos+ i*window_size if tokenpos is None else torch.Tensor([tokenpos]).long().to(device)
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        if inp_emb is not None and inp_emb.shape[1] == 1:
+            tok_emb[:,-1,:] += inp_emb
+        elif inp_emb is not None:
+            assert inp_emb.shape[1] == t, f"Input embedding must have same length as sequence"
+            tok_emb += inp_emb
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         
         new_kv = [] 
-        new_xa = []
-        attn_weights = []
-        new_interm_embed = None
         x = self.transformer.drop(tok_emb + pos_emb)
-        if rearranged_pause_idcs is not None:
-            x.scatter_(1,rearranged_pause_idcs.unsqueeze(-1).repeat(1,1,self.config.n_embd),p_embeddings)
         for i,block in enumerate(self.transformer.h):
             kv_cache_i = kv_cache[i] if kv_cache else None
-            if self.config.cross_encode or self.config.y_transformer or self.config.y_mlp:
-                interm_embed = xa_cache[i] if xa_cache else None
-            elif self.config.attend_embed:
-                interm_embed = kv_cache[self.config.interm_layer_idx] if kv_cache else None
-                #if interm_embed is not None:
-                #    interm_embed[interm_embed.shape[0]//2] = interm_embed[interm_embed.shape[0]//2] + self.wie.unsqueeze(1).unsqueeze(0)
-            else:
-                interm_embed=None
-            if self.config.y_mlp and xa_in is not None:
-                new_interm = xa_in[i]
-            else:
-                new_interm = xa_in
-            x,kv,xa,weights = block(x,kv_cache_i,interm_embed,new_interm,mask=None)
-            attn_weights.append(weights)
-            #new_kv.append(torch.cat(kv).clone().detach()) 
+            x,kv = block(x=x,kv=kv_cache_i,mask=None)
             new_kv.append(torch.cat(kv)) 
-
-            if xa[0] is not None:
-                #new_xa.append(torch.cat(xa).clone().detach())
-                new_xa.append(torch.cat(xa))
-            if i == self.config.interm_layer_idx and self.config.attend_embed:
-                #new_interm_embed = x
-                new_interm_embed = x.clone().detach()
 
         x = self.transformer.ln_f(x)
         
-        new_y_kv=[]
-        if self.config.y_transformer:
-            y = new_interm_embed
-            for i,block in enumerate(self.y_transformer.h):
-                y_cache_i = y_cache[i] if y_cache else None
-                y,y_kv,_,_ = block(y,y_cache_i)
-                #new_y_kv.append(torch.cat(y_kv).clone().detach()) 
-                new_y_kv.append(torch.cat(y_kv)) 
-
-            y = self.y_transformer.ln_f(y)
-            new_interm_embed = y
-        if self.config.y_mlp:
-            y = new_interm_embed
-            new_interm_embed = []
-            for block in self.y_mlp:
-                embed_i = block(y)
-                new_interm_embed.append(embed_i) 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
@@ -341,7 +252,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, new_kv,new_xa,new_y_kv, new_interm_embed, attn_weights,x
+        return logits, loss, new_kv, x
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

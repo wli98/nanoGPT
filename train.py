@@ -41,18 +41,6 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-window_training = False
-attend_embed = False
-y_transformer=False
-y_mlp=False
-y_mlp_depth=3
-cross_encode=False
-window_size = None
-interm_layer_idx = None
-n_y_layers = None
-pause_stage = 0
-pause_thresh = 0.7
-pause_token = 50257
 
 # wandb logging
 wandb_log = False # disabled by default
@@ -66,6 +54,7 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024
 pos_emb_block_size=2048
 # model
+latent_model=True
 n_layer = 12
 n_head = 12
 n_embd = 768
@@ -166,10 +155,7 @@ if os.path.exists(meta_path):
 # model init
 model_block_size = block_size if pos_emb_block_size is None else pos_emb_block_size
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=model_block_size,
-                  bias=bias, vocab_size=None, dropout=dropout,window_training=window_training,
-                  interm_layer_idx=interm_layer_idx,cross_encode=cross_encode,
-                  y_transformer=y_transformer,y_mlp=y_mlp,y_mlp_depth=y_mlp_depth,
-                  n_y_layers=n_y_layers,attend_embed=attend_embed,pause_stage=pause_stage) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -247,37 +233,22 @@ def estimate_loss():
         for k in tqdm(range(eval_iters)):
             X, Y = get_batch(split)
             with ctx:
-                if window_training:
+                if latent_model:
                     total_loss = 0
-                    split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
                     kv_cache = None 
-                    xa_cache = None
-                    y_cache = None
-                    interm_embed = None
-                    for i,(win_X,win_Y) in enumerate(zip(split_X,split_Y)):
-                        logits,loss,kv,xa,y,interm_embed,_ = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache,i,window_size) 
+                    inp_emb = None
+                    for i,(X_tok,Y_tok) in enumerate(zip(X,Y)):
+                        logits,loss,kv,x = model(idx=X_tok,targets=Y_tok,kv_cache=kv_cache,inp_emb=inp_emb,i=i) 
+                        inp_emb = x[:,-1,:]
                         if kv_cache is None:
                             kv_cache = kv 
                         else:
                             for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
                                 kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
-                        if xa_cache is None:
-                            xa_cache = []
-                        elif len(xa_cache) == 0:
-                            xa_cache = xa
-                        elif isinstance(xa_cache,list): 
-                            for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
-                                xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
-                        if y_cache is None:
-                            y_cache = y
-                        else: 
-                            for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
-                                y_cache[i] = torch.cat([old_y,new_y],dim=2)
- 
                         total_loss += loss
                     loss = loss.mean()
                 else:
-                    logits, loss,_,_,_,_,_,x = model(X, Y)
+                    logits, loss,_,_,x = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -354,16 +325,13 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            if window_training:
-                split_X,split_Y = torch.split(X,window_size,dim=1), torch.split(Y,window_size,dim=1) 
-                interm_embed = None
+            if latent_model:
                 kv_cache = None
-                xa_cache = None
-                y_cache =None
                 loss = []
-                for win_idx,(win_X,win_Y) in enumerate(zip(split_X,split_Y)):
+                inp_emb = None
+                for i,(X_tok,Y_tok) in enumerate(zip(X,Y)):
                     #logits,mini_loss,kv = model(win_X,win_Y,kv_cache) 
-                    logits,mini_loss,kv,xa,y,interm_embed,weights = model(win_X,win_Y,kv_cache,xa_cache,interm_embed,y_cache,win_idx,window_size) 
+                    logits,mini_loss,kv,y = model(idx=X_tok,targets=Y_tok,kv_cache=kv_cache,inp_emb=inp_emb,i=i) 
                     #loss += mini_loss
                     loss.append(mini_loss)
                     if kv_cache is None:
@@ -371,18 +339,8 @@ while True:
                     else:
                         for i,(old_kv,new_kv) in enumerate(zip(kv_cache,kv)):
                             kv_cache[i] = torch.cat([old_kv,new_kv],dim=2)
-                    if xa_cache is None:
-                        xa_cache = []
-                    elif len(xa_cache) == 0:
-                        xa_cache = xa
-                    elif isinstance(xa_cache,list): 
-                        for i,(old_xa,new_xa) in enumerate(zip(xa_cache,xa)):
-                            xa_cache[i] = torch.cat([old_xa,new_xa],dim=2)
-                    if y_cache is None:
-                        y_cache = y
-                    else: 
-                        for i,(old_y,new_y) in enumerate(zip(y_cache,y)):
-                            y_cache[i] = torch.cat([old_y,new_y],dim=2)
+                    inp_emb = y[:,-1,:]
+                    
                     #scaler.scale(mini_loss).backward(retain_graph=True)
                     #if win_idx == 1:
                 #dot = make_dot(total_loss, params=dict(model.named_parameters()))
@@ -390,77 +348,7 @@ while True:
                 #dot.render(f"autograd_graph_torchviz_total_loss", format="png")
 
             else:
-                if pause_stage > 0:
-                    for i in range(pause_stage):
-                        ctx = torch.no_grad()
-                        with ctx:
-                            seq_len = X.shape[1]
-                            logits, loss,kv,_,_,_,weights,x = model(X, Y,i=0,window_size=block_size)
-                            probs = torch.nn.functional.softmax(logits,dim=-1)    
-                            max_prob = probs.max(dim=-1)[0]
-                            pause_idcs = torch.where(max_prob<0.8)
-                            b_idx,num_pad = torch.unique(pause_idcs[0],return_counts=True) 
-                            num_to_pad = [num_pad[torch.where(b_idx==idx)[0].item()] if idx in b_idx else 0 for idx in range(batch_size) ]
-                            max_num_to_pad = max(num_to_pad).item()
-                            max_len = seq_len + max_num_to_pad
-                            X_padded = torch.nn.functional.pad(X,(0,max_num_to_pad),value=pause_token)
-                            Y_padded = torch.nn.functional.pad(Y,(0,max_num_to_pad),value=pause_token)
-                            padded_pause_idcs = []
-                            rearranged_idcs = []
-                            y_rearranged_idcs = []
-                            rearranged_pause_idcs = []
-                            num_pads = []
-                            for idx in range(batch_size):
-                                padded_pause_idx = []
-                                rearranged_pause_idx = []
-                                if idx not in b_idx:
-                                    row_idcs = [i for i in range(seq_len)] + [max_len-1] * max_num_to_pad 
-                                    y_row_idcs = [i for i in range(seq_len)] + [max_len-1] * max_num_to_pad
-                                    padded_pause_idx = [0] * max_num_to_pad
-                                    rearranged_pause_idx = [max_num_to_pad-1] * max_len 
-                                    num_padded = 0
-                                else:
-                                    idcs_to_pause = pause_idcs[1][torch.where(pause_idcs[0]==idx)[0]]
-                                    row_idcs = [i for i in range(seq_len)]
-                                    y_row_idcs = [i for i in range(seq_len)]
-                                    num_padded = 0
-                                    for p_idx in idcs_to_pause:
-                                        #if p_idx == 0: continue
-                                        row_idcs.insert(p_idx.item()+num_padded+1,max_len-1)
-                                        y_row_idcs.insert(p_idx.item()+num_padded,max_len-1)
-                                        padded_pause_idx.append(p_idx.item())
-                                        rearranged_pause_idx.append(p_idx.item()+num_padded+1)
-                                        num_padded += 1
-                                num_pads.append(num_padded)
-                                row_idcs = row_idcs + [max_len-1] * (max_len-len(row_idcs))
-                                rearranged_idcs.append(row_idcs)
-                                y_row_idcs = y_row_idcs + [max_len-1] * (max_len-len(y_row_idcs))
-                                y_rearranged_idcs.append(y_row_idcs)
-                                rearranged_pause_idx = rearranged_pause_idx + [max_len-1] * (max_num_to_pad-len(rearranged_pause_idx))
-                                rearranged_pause_idcs.append(rearranged_pause_idx)
-                                padded_pause_idx = padded_pause_idx + [0]*(max_num_to_pad-len(padded_pause_idx))
-                                padded_pause_idcs.append(padded_pause_idx)
-                            rearranged_idcs = torch.Tensor(rearranged_idcs).to(X.device,dtype=torch.int64)
-                            y_rearranged_idcs = torch.Tensor(y_rearranged_idcs).to(X.device,dtype=torch.int64)
- 
-                            rearranged_pause_idcs = torch.Tensor(rearranged_pause_idcs).to(X.device,dtype=torch.int64)
-                            padded_pause_idcs = torch.Tensor(padded_pause_idcs).to(X.device,dtype=torch.int64)
-
-                            X_with_pad = torch.gather(X_padded,1,rearranged_idcs)
-                            Y_with_pad = torch.gather(Y_padded,1,y_rearranged_idcs)
-                            #padding needs to account for different lengths when stage > 1
-                            seq_lens = seq_len + torch.Tensor(num_pads)
-                            mask = torch.arange(0,max_len).unsqueeze(0).repeat(batch_size,1)
-                            mask = mask<seq_lens.unsqueeze(1).repeat(1,max_len)
-                            num_pads = torch.Tensor(num_pads).to(X.device)
-
-                        p_outputs = model(None,p_forward=True,p_forward_x=x) 
-                        p_embeddings = torch.gather(p_outputs,1,padded_pause_idcs.unsqueeze(-1).repeat(1,1,n_embd))
-                        X = X_with_pad
-                        Y = Y_with_pad
-                else:
-                    rearranged_pause_idcs=padded_pause_idcs=p_embeddings=mask=None
-                logits, loss,_,_,_,_,weights,_ = model(X, Y,i=0,window_size=block_size,rearranged_pause_idcs=rearranged_pause_idcs,p_embeddings=p_embeddings,mask=mask)
+                logits, loss,_,_ = model(X, Y)
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
                 total_loss = loss.item()
                 #dot = make_dot(loss, params=dict(model.named_parameters()))
@@ -470,8 +358,8 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        if window_training:
-            num_splits = len(split_X)
+        if latent_model:
+            num_splits = X.shape[1] 
             total_loss = sum(loss)/num_splits
             scaler.scale(total_loss).backward()
         else:
@@ -494,16 +382,7 @@ while True:
                 "iter": iter_num,
                 f"grad/layer {i}": total_norm
             },step=iter_num)
-        if hasattr(model.module,"y_transformer"):
-            for i,layer in enumerate(model.module.y_transformer.h):
-                total_norm = 0
-                for param in layer.parameters():
-                    param_norm = param.grad.data.norm(2)
-                    total_norm += param_norm
-                wandb.log({
-                    "iter": iter_num,
-                    f"grad/y_layer {i}": total_norm
-                },step=iter_num)
+        
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -521,18 +400,12 @@ while True:
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         if wandb_log:
-           wandb.log({
+            wandb.log({
                 "iter": iter_num,
                 "train_log/loss": lossf,
                 "train_log/lr":lr
             },step=iter_num)
-           for i,pair in enumerate(weights):
-                wandb.log({
-                "iter": iter_num,
-                f"weight_{i}/xa": pair[0].item() if isinstance(pair[0],torch.Tensor) else pair[0],
-                f"weight_{i}/kv": pair[1].item() if isinstance(pair[1],torch.Tensor) else pair[1],
-            },step=iter_num)
-
+           
     iter_num += 1
     local_iter_num += 1
 
